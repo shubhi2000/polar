@@ -5,6 +5,7 @@ from uuid import UUID
 
 import httpx
 import structlog
+from apscheduler.triggers.cron import CronTrigger
 from dramatiq import Retry
 from standardwebhooks.webhooks import Webhook as StandardWebhook
 
@@ -25,15 +26,42 @@ log: Logger = structlog.get_logger()
     max_retries=settings.WEBHOOK_MAX_RETRIES,
     priority=TaskPriority.MEDIUM,
 )
-async def webhook_event_send(webhook_event_id: UUID) -> None:
+async def webhook_event_send(webhook_event_id: UUID, redeliver: bool = False) -> None:
     async with AsyncSessionMaker() as session:
-        return await _webhook_event_send(session, webhook_event_id=webhook_event_id)
+        return await _webhook_event_send(
+            session, webhook_event_id=webhook_event_id, redeliver=redeliver
+        )
 
 
-async def _webhook_event_send(session: AsyncSession, *, webhook_event_id: UUID) -> None:
+async def _webhook_event_send(
+    session: AsyncSession, *, webhook_event_id: UUID, redeliver: bool = False
+) -> None:
     event = await webhook_service.get_event_by_id(session, webhook_event_id)
     if not event:
         raise Exception(f"webhook event not found id={webhook_event_id}")
+
+    bound_log = log.bind(
+        id=webhook_event_id,
+        type=event.type,
+        webhook_endpoint_id=event.webhook_endpoint_id,
+    )
+
+    if event.payload is None:
+        bound_log.info("Archived event, skipping")
+        return
+
+    if event.succeeded and not redeliver:
+        bound_log.info("Event already succeeded, skipping")
+        return
+
+    if not await webhook_service.is_latest_event(session, event):
+        log.info(
+            "Earlier events need to be delivered first, retrying later",
+            id=event.id,
+            type=event.type,
+            webhook_endpoint_id=event.webhook_endpoint_id,
+        )
+        raise Retry()
 
     ts = utc_now()
 
@@ -70,7 +98,7 @@ async def _webhook_event_send(session: AsyncSession, *, webhook_event_id: UUID) 
             response.raise_for_status()
         # Error
         except (httpx.HTTPError, SSLError) as e:
-            log.debug("An errror occurred while sending a webhook", error=e)
+            bound_log.debug("An errror occurred while sending a webhook", error=e)
             delivery.succeeded = False
             # Permanent failure
             if not can_retry():
@@ -95,3 +123,15 @@ async def _webhook_event_send(session: AsyncSession, *, webhook_event_id: UUID) 
 async def webhook_event_success(webhook_event_id: UUID) -> None:
     async with AsyncSessionMaker() as session:
         return await webhook_service.on_event_success(session, webhook_event_id)
+
+
+@actor(
+    actor_name="webhook_event.archive",
+    cron_trigger=CronTrigger(hour=0, minute=0),
+    priority=TaskPriority.LOW,
+)
+async def webhook_event_archive() -> None:
+    async with AsyncSessionMaker() as session:
+        return await webhook_service.archive_events(
+            session, older_than=utc_now() - settings.WEBHOOK_EVENT_RETENTION_PERIOD
+        )
